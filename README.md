@@ -29,6 +29,20 @@ A Swift command-line tool to synchronize tasks from a CSV file with Apple Remind
    swift build -c release
    ```
 3. The binary will be located at `.build/release/csv-reminders-sync`
+4. Move the binary to a directory in your PATH, e.g. `/usr/local/bin`
+
+- ensure that the directory exists
+```bash
+sudo mkdir -p /usr/local/bin
+```
+- copy the binary to the directory
+```bash
+sudo cp .build/release/csv-reminders-sync /usr/local/bin/csv-reminders-sync
+```
+- make the binary executable
+```bash
+sudo chmod +x /usr/local/bin/csv-reminders-sync
+```
 
 Alternatively, you can run directly using:
 ```bash
