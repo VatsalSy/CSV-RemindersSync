@@ -6,13 +6,57 @@ import EventKit
 
 @main
 struct CSVRemindersSync {
+    static func findRemindersList(named listName: String, in eventStore: EKEventStore) -> EKCalendar? {
+        // Get all reminder lists (calendars)
+        let calendars = eventStore.calendars(for: .reminder)
+        
+        // Try to find the specified list
+        return calendars.first { calendar in
+            calendar.title.lowercased() == listName.lowercased()
+        }
+    }
+    
+    static func findExistingReminder(with url: String, in eventStore: EKEventStore) -> EKReminder? {
+        // Create a predicate to fetch all reminders
+        let predicate = eventStore.predicateForReminders(in: nil)
+        
+        // Fetch reminders synchronously
+        var existingReminders: [EKReminder]?
+        let group = DispatchGroup()
+        group.enter()
+        
+        eventStore.fetchReminders(matching: predicate) { reminders in
+            existingReminders = reminders
+            group.leave()
+        }
+        group.wait()
+        
+        // Search for a reminder with matching URL in notes
+        return existingReminders?.first { reminder in
+            if let notes = reminder.notes {
+                return notes.contains("URL: \(url)")
+            }
+            return false
+        }
+    }
+    
     static func main() async throws {
-        // 1. Locate the CSV file named "test.csv" in the current folder.
-        let csvURL = URL(fileURLWithPath: "test.csv")
+        // Get the CSV filename and list name from command line arguments
+        guard CommandLine.arguments.count >= 2 else {
+            print("Error: Please provide the CSV filename as an argument.")
+            print("Usage: csv-reminders-sync <csv-file> [list-name]")
+            return
+        }
+        
+        let csvFilename = CommandLine.arguments[1]
+        let listName = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : nil
+        
+        // 1. Locate the CSV file from the provided filename
+        let csvURL = URL(fileURLWithPath: csvFilename)
 
         // 2. Read the file contents into a string.
         guard FileManager.default.fileExists(atPath: csvURL.path) else {
-            print("Error: test.csv not found in the current directory.")
+            print("Error: \(csvFilename) not found in the current directory.")
             return
         }
         let csvContent = try String(contentsOf: csvURL, encoding: .utf8)
@@ -25,7 +69,7 @@ struct CSVRemindersSync {
 
         // 4. Make sure there's at least a header row plus one data row.
         guard lines.count > 1 else {
-            print("No task data found in test.csv.")
+            print("No task data found in \(csvFilename).")
             return
         }
 
@@ -38,10 +82,19 @@ struct CSVRemindersSync {
             return
         }
 
-        // 6. Use the default Reminders calendar for new reminders.
-        guard let remindersCalendar = eventStore.defaultCalendarForNewReminders() else {
-            print("No default Reminders calendar available.")
-            return
+        // 6. Find the specified reminders list or use inbox
+        let remindersCalendar: EKCalendar
+        if let listName = listName, let specifiedList = findRemindersList(named: listName, in: eventStore) {
+            remindersCalendar = specifiedList
+            print("Using specified list: \(listName)")
+        } else {
+            if let defaultCalendar = eventStore.defaultCalendarForNewReminders() {
+                remindersCalendar = defaultCalendar
+                print("Using default Reminders list (Inbox)")
+            } else {
+                print("No Reminders list available.")
+                return
+            }
         }
 
         // 7. Split each row by comma and create a reminder.
@@ -55,21 +108,52 @@ struct CSVRemindersSync {
 
         print("Found columns - URL: \(urlIndex), Task: \(taskIndex), Status: \(statusIndex), Priority: \(priorityIndex), Due Date: \(dueDateIndex)")
 
-        for line in lines.dropFirst() {
+        // Keep track of processed URLs to avoid processing older entries of the same URL
+        var processedUrls = Set<String>()
+        
+        // Process lines in reverse order (from bottom to top, excluding header)
+        for line in lines.dropFirst().reversed() {
             let columns = parseCSVLine(String(line))
             
-            // Create a new reminder.
-            let reminder = EKReminder(eventStore: eventStore)
-            reminder.calendar = remindersCalendar
+            // Get the URL first to check for existing reminder
+            guard urlIndex >= 0, urlIndex < columns.count else {
+                print("Error: URL column not found or invalid")
+                continue
+            }
+            
+            let url = columns[urlIndex].replacingOccurrences(of: "\"", with: "")
+            
+            // Skip if we've already processed this URL (means we've seen a more recent entry)
+            if processedUrls.contains(url) {
+                print("Skipping older entry for URL: \(url)")
+                continue
+            }
+            
+            // Mark this URL as processed
+            processedUrls.insert(url)
+            
+            // Try to find an existing reminder with this URL
+            let reminder: EKReminder
+            if let existingReminder = findExistingReminder(with: url, in: eventStore) {
+                reminder = existingReminder
+                print("Found existing reminder with URL: \(url)")
+            } else {
+                reminder = EKReminder(eventStore: eventStore)
+                reminder.calendar = remindersCalendar
+                print("Creating new reminder for URL: \(url)")
+            }
 
-            // Assign values from CSV if available.
+            // Update reminder fields
             if taskIndex >= 0, taskIndex < columns.count {
                 reminder.title = columns[taskIndex].replacingOccurrences(of: "\"", with: "")
             }
 
+            var notes = ""
             if statusIndex >= 0, statusIndex < columns.count {
-                reminder.notes = "Status: \(columns[statusIndex].replacingOccurrences(of: "\"", with: ""))"
+                notes += "Status: \(columns[statusIndex].replacingOccurrences(of: "\"", with: ""))\n"
             }
+            notes += "URL: \(url)"
+            reminder.notes = notes
 
             if priorityIndex >= 0, priorityIndex < columns.count {
                 let priorityStr = columns[priorityIndex].replacingOccurrences(of: "\"", with: "")
@@ -87,24 +171,16 @@ struct CSVRemindersSync {
                 }
             }
 
-            // Store the URL in the notes
-            if urlIndex >= 0, urlIndex < columns.count {
-                let url = columns[urlIndex].replacingOccurrences(of: "\"", with: "")
-                if let existingNotes = reminder.notes {
-                    reminder.notes = "\(existingNotes)\nURL: \(url)"
-                } else {
-                    reminder.notes = "URL: \(url)"
-                }
-            }
-
-            // 8. Save the reminder to Apple Reminders.
+            // Save the reminder
             do {
                 try eventStore.save(reminder, commit: true)
-                print("Successfully created reminder: \(reminder.title ?? "Untitled")")
+                print("Successfully \(reminder == reminder ? "updated" : "created") reminder: \(reminder.title ?? "Untitled")")
             } catch {
                 print("Could not save reminder: \(error)")
             }
         }
+        
+        print("\nProcessing complete. Processed \(processedUrls.count) unique URLs.")
     }
     
     // Helper function to parse CSV lines properly
